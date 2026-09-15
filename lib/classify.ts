@@ -52,7 +52,7 @@ async function callGemini(article: RawArticle): Promise<Response> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY is not set");
 
-  const model = process.env.GEMINI_MODEL || "gemini-3.6-flash";
+  const model = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const prompt = `${SYSTEM_INSTRUCTION}\n\nHeadline: ${article.title}\nSource: ${article.source}\nExcerpt: ${article.description.slice(0, 500)}`;
@@ -125,18 +125,21 @@ async function classifyOne(article: RawArticle): Promise<ClassifiedArticle | nul
   }
 }
 
-// Gemini's free tier allows 15 requests per minute. We space requests
-// about 4.3 seconds apart (roughly 14/min) to stay safely under that,
-// and process sequentially rather than in batches with long pauses, so
-// this finishes well inside Vercel's 300-second function time limit
-// (60 articles x 4.3s is about 4.3 minutes). Because the pipeline only
-// classifies articles it hasn't seen before (see the /api/refresh
-// route), each run is normally well under that cap even with 18 source
-// feeds, most of what comes back on a given run is duplicates already
-// stored from a previous run.
+// Gemini's free tier allows roughly 15 requests per minute. We space
+// requests about 4.3 seconds apart to stay under that, and process
+// sequentially rather than in batches with long pauses.
+//
+// onClassified, if provided, is called immediately after each article is
+// successfully classified, before moving to the next one. This is what
+// lets the caller save each result to the database as it happens, so a
+// Vercel timeout partway through a run doesn't lose everything already
+// done, only the articles not yet reached. Storing everything in one
+// batch at the very end was the original design, and it meant a single
+// timeout wiped out an entire run's worth of successful work.
 export async function classifyArticles(
   articles: RawArticle[],
-  maxToProcess = 60
+  onClassified?: (article: ClassifiedArticle) => Promise<void>,
+  maxToProcess = 45
 ): Promise<ClassifiedArticle[]> {
   const SPACING_MS = 4300;
   const results: ClassifiedArticle[] = [];
@@ -145,7 +148,16 @@ export async function classifyArticles(
   for (const article of toProcess) {
     try {
       const classified = await classifyOne(article);
-      if (classified) results.push(classified);
+      if (classified) {
+        results.push(classified);
+        if (onClassified) {
+          try {
+            await onClassified(classified);
+          } catch (err) {
+            console.error(`Failed to save "${classified.title}"`, err);
+          }
+        }
+      }
     } catch (err) {
       console.error(`Classification failed for "${article.title}"`, err);
     }
