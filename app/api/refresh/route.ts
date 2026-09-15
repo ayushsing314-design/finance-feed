@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { fetchAllFeeds } from "@/lib/fetchFeeds";
-import { classifyArticles } from "@/lib/classify";
+import { classifyArticles, ClassifiedArticle } from "@/lib/classify";
 import { getServerSupabase } from "@/lib/supabase";
 
 // Allow up to 5 minutes. Vercel's Hobby plan supports this via Fluid
@@ -49,36 +49,46 @@ export async function POST(req: NextRequest) {
   const newArticles = rawArticles.filter((a) => !existingLinks.has(a.link));
 
   if (newArticles.length === 0) {
-    return NextResponse.json({ message: "No new articles found", added: 0 });
+    return NextResponse.json({ message: "No new articles found", fetched: rawArticles.length, new: 0, stored: 0 });
   }
 
-  // 3. Filter and classify only the new ones.
-  const classified = await classifyArticles(newArticles);
-
-  // 4. Store. onConflict guards against a race if two triggers overlap.
-  if (classified.length > 0) {
-    const rows = classified.map((c) => ({
-      title: c.title,
-      link: c.link,
-      source: c.source,
-      category: c.category,
-      summary: c.summary,
-      why_it_matters: c.whyItMatters,
-      published_at: c.publishedAt,
-      fetched_at: new Date().toISOString(),
-    }));
-
-    const { error } = await supabase.from("articles").upsert(rows, { onConflict: "link" });
+  // 3. Classify, saving each article to Supabase the moment it's ready
+  //    rather than waiting for the whole batch. If Vercel cuts the
+  //    function off mid-run, everything classified before that point is
+  //    already safely stored, only the remainder is lost, and the next
+  //    scheduled run picks up where this one left off (since already-
+  //    stored links are excluded from "new" articles in step 2 above).
+  let storedCount = 0;
+  const saveOne = async (article: ClassifiedArticle) => {
+    const { error } = await supabase.from("articles").upsert(
+      [
+        {
+          title: article.title,
+          link: article.link,
+          source: article.source,
+          category: article.category,
+          summary: article.summary,
+          why_it_matters: article.whyItMatters,
+          published_at: article.publishedAt,
+          fetched_at: new Date().toISOString(),
+        },
+      ],
+      { onConflict: "link" }
+    );
     if (error) {
-      console.error("Insert error", error);
-      return NextResponse.json({ error: "Failed to store articles" }, { status: 500 });
+      console.error(`Insert error for "${article.title}"`, error);
+    } else {
+      storedCount++;
     }
-  }
+  };
+
+  const classified = await classifyArticles(newArticles, saveOne);
 
   return NextResponse.json({
     message: "Refresh complete",
     fetched: rawArticles.length,
     new: newArticles.length,
-    stored: classified.length,
+    classified: classified.length,
+    stored: storedCount,
   });
 }
