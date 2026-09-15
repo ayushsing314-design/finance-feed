@@ -67,7 +67,11 @@ async function classifyOne(article: RawArticle): Promise<ClassifiedArticle | nul
   });
 
   if (!res.ok) {
-    console.error(`Gemini API error ${res.status} for "${article.title}"`);
+    // Log the full response body, not just the status code, this is what
+    // actually names the problem (wrong model, API not enabled, bad key,
+    // quota exceeded, etc.) instead of a bare, unhelpful "404".
+    const errorBody = await res.text();
+    console.error(`Gemini API error ${res.status} for "${article.title}": ${errorBody}`);
     return null;
   }
 
