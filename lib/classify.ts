@@ -48,23 +48,43 @@ If relevant, respond ONLY with valid JSON in this exact shape, no markdown, no e
 If not relevant, respond ONLY with:
 {"relevant": false}`;
 
-async function classifyOne(article: RawArticle): Promise<ClassifiedArticle | null> {
+async function callGemini(article: RawArticle): Promise<Response> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY is not set");
 
-  const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+  const model = process.env.GEMINI_MODEL || "gemini-3.6-flash";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const prompt = `${SYSTEM_INSTRUCTION}\n\nHeadline: ${article.title}\nSource: ${article.source}\nExcerpt: ${article.description.slice(0, 500)}`;
 
-  const res = await fetch(url, {
+  return fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.2, maxOutputTokens: 300 },
+      // thinkingConfig with a low level stops gemini-3.6-flash from
+      // spending tokens on internal reasoning before answering, which
+      // was eating into our output budget and causing cut-off JSON.
+      // maxOutputTokens raised as a safety margin on top of that.
+      generationConfig: {
+        temperature: 0.2,
+        maxOutputTokens: 500,
+        thinkingConfig: { thinkingLevel: "minimal" },
+      },
     }),
   });
+}
+
+async function classifyOne(article: RawArticle): Promise<ClassifiedArticle | null> {
+  let res = await callGemini(article);
+
+  // 503 means Gemini is temporarily overloaded, not a real problem with
+  // our request, so it's worth exactly one retry after a short pause
+  // rather than giving up on an otherwise-good article.
+  if (res.status === 503) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    res = await callGemini(article);
+  }
 
   if (!res.ok) {
     // Log the full response body, not just the status code, this is what
@@ -78,8 +98,12 @@ async function classifyOne(article: RawArticle): Promise<ClassifiedArticle | nul
   const data = await res.json();
   const text: string = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
-  // Strip accidental markdown code fences before parsing.
-  const cleaned = text.replace(/```json|```/g, "").trim();
+  // Extract only the {...} block, ignoring any commentary or reasoning
+  // text the model might place before or after it, rather than assuming
+  // the entire response is pure JSON.
+  const jsonStart = text.indexOf("{");
+  const jsonEnd = text.lastIndexOf("}");
+  const cleaned = jsonStart !== -1 && jsonEnd !== -1 ? text.slice(jsonStart, jsonEnd + 1) : text.trim();
 
   try {
     const parsed = JSON.parse(cleaned);
